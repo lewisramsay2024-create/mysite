@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Disposable Login</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 24px; display: flex; justify-content: center; }
+  .wrap { width: 100%; max-width: 560px; }
+  h1 { margin-top: 0; }
+  .card { background: #1e293b; border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+  label { font-size: 13px; color: #94a3b8; display: block; margin-bottom: 6px; }
+  .row { display: flex; gap: 8px; margin-bottom: 16px; }
+  input { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: 15px; }
+  button { padding: 10px 16px; border: 0; border-radius: 8px; background: #6366f1; color: white; font-size: 15px; cursor: pointer; }
+  button:hover { background: #4f46e5; }
+  button.big { width: 100%; padding: 14px; font-size: 17px; }
+  button.danger { background: #dc2626; }
+  #timer { font-size: 28px; font-weight: bold; text-align: center; }
+  #status { text-align: center; color: #94a3b8; font-size: 14px; min-height: 20px; }
+  .mail { border-top: 1px solid #334155; padding: 12px 0; cursor: pointer; }
+  .mail:first-child { border-top: 0; }
+  .mail .from { font-size: 13px; color: #94a3b8; }
+  .mail .subject { font-weight: 600; }
+  #reader { white-space: pre-wrap; background: #0f172a; padding: 12px; border-radius: 8px; margin-top: 10px; display: none; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Disposable Login</h1>
+  <div class="card">
+    <button class="big" id="gen">Generate new email and password</button>
+    <p id="status"></p>
+  </div>
+
+  <div id="account" class="card hidden">
+    <div id="timer">20:00</div>
+    <p style="text-align:center;color:#94a3b8;font-size:13px;margin-top:0">until this login is deleted</p>
+    <label>Email</label>
+    <div class="row"><input id="email" readonly><button onclick="copyField('email', this)">Copy</button></div>
+    <label>Password</label>
+    <div class="row"><input id="password" readonly><button onclick="copyField('password', this)">Copy</button></div>
+    <button class="danger" id="destroy">Delete now</button>
+  </div>
+
+  <div id="inboxCard" class="card hidden">
+    <h3 style="margin-top:0">Inbox</h3>
+    <div id="inbox"><p style="color:#94a3b8">No messages yet. Checking every 5 seconds...</p></div>
+    <div id="reader"></div>
+  </div>
+</div>
+
+<script>
+const RELAY = '/.netlify/functions/mailtm';
+const LIFETIME_MS = 20 * 60 * 1000;
+let token = null, accountId = null, expiresAt = 0, pollTimer = null, countdownTimer = null;
+
+const $ = id => document.getElementById(id);
+
+// Every request goes to our own relay, which forwards it to Mail.tm
+function api(path, options = {}) {
+  return fetch(RELAY + '?path=' + encodeURIComponent(path), options);
+}
+
+function rand(len, chars) {
+  const arr = new Uint32Array(len);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, n => chars[n % chars.length]).join('');
+}
+
+function makePassword() {
+  const all = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*';
+  return rand(1, 'abcdefghijkmnopqrstuvwxyz') + rand(1, 'ABCDEFGHJKLMNPQRSTUVWXYZ') +
+         rand(1, '23456789') + rand(1, '!@#$%^&*') + rand(12, all);
+}
+
+async function generate() {
+  await destroy(true);
+  $('gen').disabled = true;
+  $('status').textContent = 'Creating your inbox...';
+  try {
+    const domRes = await api('/domains');
+    if (!domRes.ok) throw new Error('Could not get domains (' + domRes.status + ')');
+    const domData = await domRes.json();
+    const members = domData['hydra:member'] || domData;
+    const domain = members[0].domain;
+
+    const address = rand(10, 'abcdefghijklmnopqrstuvwxyz0123456789') + '@' + domain;
+    const password = makePassword();
+
+    const accRes = await api('/accounts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address, password })
+    });
+    if (!accRes.ok) throw new Error('Could not create account (' + accRes.status + ')');
+    const acc = await accRes.json();
+    accountId = acc.id;
+
+    const tokRes = await api('/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address, password })
+    });
+    if (!tokRes.ok) throw new Error('Could not log in (' + tokRes.status + ')');
+    token = (await tokRes.json()).token;
+
+    $('email').value = address;
+    $('password').value = password;
+    $('account').classList.remove('hidden');
+    $('inboxCard').classList.remove('hidden');
+    $('status').textContent = 'Ready! Copy and paste the details below.';
+
+    expiresAt = Date.now() + LIFETIME_MS;
+    startCountdown();
+    pollInbox();
+    pollTimer = setInterval(pollInbox, 5000);
+  } catch (err) {
+    $('status').textContent = 'Something went wrong: ' + err.message + '. Try again in a moment.';
+  }
+  $('gen').disabled = false;
+}
+
+function startCountdown() {
+  clearInterval(countdownTimer);
+  countdownTimer = setInterval(() => {
+    const left = expiresAt - Date.now();
+    if (left <= 0) { destroy(false); return; }
+    const m = Math.floor(left / 60000);
+    const s = Math.floor((left % 60000) / 1000);
+    $('timer').textContent = m + ':' + String(s).padStart(2, '0');
+  }, 500);
+}
+
+async function pollInbox() {
+  if (!token) return;
+  try {
+    const res = await api('/messages', { headers: { Authorization: 'Bearer ' + token } });
+    const data = await res.json();
+    const msgs = data['hydra:member'] || [];
+    if (msgs.length === 0) return;
+    $('inbox').innerHTML = '';
+    msgs.forEach(m => {
+      const div = document.createElement('div');
+      div.className = 'mail';
+      div.innerHTML = '<div class="from"></div><div class="subject"></div>';
+      div.querySelector('.from').textContent = m.from.address;
+      div.querySelector('.subject').textContent = m.subject || '(no subject)';
+      div.onclick = () => openMessage(m.id);
+      $('inbox').appendChild(div);
+    });
+  } catch (e) { /* try again next tick */ }
+}
+
+async function openMessage(id) {
+  const res = await api('/messages/' + id, { headers: { Authorization: 'Bearer ' + token } });
+  const m = await res.json();
+  $('reader').style.display = 'block';
+  $('reader').textContent = m.text || '(This email has no plain text version.)';
+}
+
+async function destroy(quiet) {
+  clearInterval(pollTimer);
+  clearInterval(countdownTimer);
+  if (token && accountId) {
+    try {
+      await api('/accounts/' + accountId, { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+    } catch (e) {}
+  }
+  token = null; accountId = null;
+  $('email').value = ''; $('password').value = '';
+  $('inbox').innerHTML = '<p style="color:#94a3b8">No messages yet. Checking every 5 seconds...</p>';
+  $('reader').style.display = 'none'; $('reader').textContent = '';
+  $('account').classList.add('hidden');
+  $('inboxCard').classList.add('hidden');
+  if (!quiet) $('status').textContent = 'Login deleted. Generate a new one any time.';
+}
+
+function copyField(id, btn) {
+  navigator.clipboard.writeText($(id).value);
+  const old = btn.textContent;
+  btn.textContent = 'Copied!';
+  setTimeout(() => btn.textContent = old, 1200);
+}
+
+$('gen').onclick = generate;
+$('destroy').onclick = () => destroy(false);
+</script>
+</body>
+</html>
